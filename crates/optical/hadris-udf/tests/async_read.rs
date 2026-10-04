@@ -7,9 +7,11 @@
 
 use core::future::Future;
 use core::task::{Context, Poll};
+use core::usize;
 use std::sync::Arc;
 use std::task::{Wake, Waker};
 
+use hadris_common::types::extent;
 use hadris_udf::r#async::UdfVolume;
 use hadris_udf::sync::write::{SimpleDir, SimpleFile, UdfWriteOptions, UdfWriter};
 
@@ -55,6 +57,26 @@ fn async_leaf_opens_traverses_and_reads_nested_file() {
         let docs = root.find("DOCS").unwrap();
         let nested = volume.read_directory(&docs.icb).await.unwrap();
         let readme = nested.find("README.TXT").unwrap();
+
+        let layout = volume.file_layout(readme).await.unwrap();
+        assert_eq!(layout.length, payload.len());
+
+        let extent_total: u64 = layout.extents.iter().map(|extent| extent.length).sum();
+        assert_eq!(extent_total, layout.length);
+
+        let mut reconstructed = Vec::with_capacity(payload.len());
+        for extent in &layout.extents {
+            let start = usize::try_from(extent.source_offset).unwrap();
+            let length = usize::try_from(extent.length).unwrap();
+            let end = start.checked_add(length).unwrap();
+
+            assert!(end <= bytes.len(), "extent must stay inside the UDF image");
+
+            reconstructed.extend_from_slice(&bytes[start..end]);
+        }
+
+        assert_eq!(reconstructed, payload);
+
         assert_eq!(volume.read_file(readme).await.unwrap(), payload);
         assert!(volume.read_file(docs).await.is_err());
     });

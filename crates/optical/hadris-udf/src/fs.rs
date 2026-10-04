@@ -8,9 +8,9 @@ use super::super::{Read, Seek, SeekFrom};
 
 use super::descriptor::DescriptorTag;
 use super::descriptor::{
-    self, AnchorVolumeDescriptorPointer, ExtentDescriptor, FileSetDescriptor,
+    self, AnchorVolumeDescriptorPointer, ExtentDescriptor, ExtentType, FileSetDescriptor,
     LogicalVolumeDescriptor, LongAllocationDescriptor, PartitionDescriptor,
-    PrimaryVolumeDescriptor, TagIdentifier, parse_vrs,
+    PrimaryVolumeDescriptor, ShortAllocationDescriptor, TagIdentifier, parse_vrs,
 };
 use super::dir::{
     FileCharacteristics, FileIdentifierDescriptor, UdfDir, UdfDirEntry, decode_filename,
@@ -33,6 +33,22 @@ pub struct UdfVolumeInfo {
     /// Exact UDF revision from the logical-volume domain identifier when
     /// present, otherwise a representative revision for the detected VRS family.
     pub udf_revision: UdfRevision,
+}
+
+/// One physically continous range of udf file in the source image
+pub struct UdfFileExtent {
+    /// absolute byte offset in the underlying ISO/UDF image
+    pub source_offset: u64,
+    /// Number of logical bytes stored in this extent
+    pub length: u64,
+}
+
+/// The physical layout of one regular UDF file
+pub struct UdfFileLayout {
+    /// the logical length of the file
+    pub length: u64,
+    /// Ordered extents which compose the file
+    pub extents: Vec<UdfFileExtent>,
 }
 
 /// Main UDF filesystem handle
@@ -209,6 +225,106 @@ impl<DATA: Read + Seek> UdfVolume<DATA> {
     /// Get the root directory
     pub async fn root_dir(&self) -> Result<UdfDir> {
         self.read_directory(&self.root_icb).await
+    }
+
+    /// Return the source image intents of a regular udf  file without reading
+    pub async fn file_layout(&self, entry: &UdfDirEntry) -> Result<UdfFileLayout>{
+       if entry.is_dir(){
+            return Err(Error::NotAFile);
+       }
+
+       let mut data = self.data.lock();
+       let meta = self.read_icb(&mut data, &entry.icb).await?;
+       if meta.is_directory{
+           return Err(Error::NotAFile);
+       }
+
+       let mut remaining = meta.size;
+       let mut extents = Vec::new();
+       let allocation_range = validated_alloc_range(meta.buffer.len(), meta.alloc_offset, meta.alloc_length)?;
+
+       match meta.allocation_type {
+           AllocationType::Short => {
+              for chunk in meta.buffer[allocation_range].chunks_exact(8) {
+                if remaining == 0 {
+                    break;
+                }
+
+                let descriptor = bytemuck::pod_read_unaligned::<ShortAllocationDescriptor>(chunk).into_native();
+                if descriptor.length() == 0 {
+                    break;
+                }
+
+                if descriptor.extent_type() != ExtentType::RecordedAllocated{
+                    return Err(Error::InvalidIcb);
+                }
+
+                let source_block = (self.info.partition_start as u64)
+                    .checked_add(descriptor.extent_position as u64)
+                    .ok_or(Error::InvalidIcb)?;
+
+                let source_offset = source_block
+                    .checked_mul(SECTOR_SIZE as u64)
+                    .ok_or(Error::InvalidIcb)?;
+
+                let length = u64::from(descriptor.length()).min(remaining);
+
+                extents.push(UdfFileExtent{
+                    source_offset,
+                    length,
+                });
+
+                remaining -= length;
+              }
+           }
+
+           AllocationType::Long => {
+              for chunk in meta.buffer[allocation_range].chunks_exact(16){
+                  if remaining == 0 {
+                      break;
+                  }
+
+                  let descriptor = bytemuck::pod_read_unaligned::<LongAllocationDescriptor>(chunk).into_native();
+                  if descriptor.length() == 0 {
+                      break;
+                  }
+
+                  if descriptor.extent_type() != ExtentType::RecordedAllocated {
+                      return Err(Error::InvalidIcb);
+                  }
+
+                  if descriptor.partition_ref_num != 0 {
+                      return Err(Error::InvalidPartition(descriptor.partition_ref_num));
+                  }
+
+                  let source_block = (self.info.partition_start as u64).checked_add(descriptor.logical_block_num as u64).ok_or(Error::InvalidIcb)?;
+                  let source_offset = source_block.checked_mul(SECTOR_SIZE as u64).ok_or(Error::InvalidIcb)?;
+
+                  let length = u64::from(descriptor.length()).min(remaining);
+
+                  extents.push(UdfFileExtent{
+                      source_offset,
+                      length
+                  });
+
+                  remaining -= length;
+
+              }
+           }
+
+           AllocationType::Embedded | AllocationType::Extended => {
+                return Err(Error::InvalidIcb);
+           }
+       }
+
+       if remaining != 0 {
+         return Err(Error::InvalidIcb);
+       }
+
+       Ok(UdfFileLayout{
+           length: meta.size,
+           extents
+       })
     }
 
     /// Read the full contents of a regular file.
